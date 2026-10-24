@@ -307,12 +307,38 @@ impl WebFsm {
     /// controls scheme this page was never written for -- and it keeps the
     /// operator fresh either way.
     pub fn set_command(&mut self, lin_vel_x: f32, lin_vel_y: f32, yaw_rate: f32, now_us: f64) {
+        if lin_vel_x != 0.0 || lin_vel_y != 0.0 || yaw_rate != 0.0 {
+            self.controller.disable_passive();
+        }
         self.last_command_us = Some(now_us as u64);
         self.command = Command { lin_vel_x, lin_vel_y, yaw_rate, ..Default::default() };
     }
 
     /// One tick. Returns the mode that needs an inference, or `null` when the
     /// tick is finished and `positions()` is ready to publish.
+    pub fn enable_passive(&mut self, config_json: &str, now_us: f64) -> Result<(), JsError> {
+        if !now_us.is_finite() || now_us < 0.0 {
+            return Err(JsError::new("invalid monotonic timestamp"));
+        }
+        let config = serde_json::from_str(config_json)?;
+        self.controller.enable_passive(config, now_us as u64).map_err(|e| JsError::new(&e))
+    }
+
+    pub fn disable_passive(&mut self) { self.controller.disable_passive(); }
+
+    pub fn passive_phase(&self) -> Option<String> {
+        self.controller.passive_phase().map(|p| format!("{p:?}"))
+    }
+
+    pub fn observe_face(&mut self, azimuth: f32, elevation: f32, confidence: f32,
+        captured_us: f64, received_us: f64) -> bool {
+        if !captured_us.is_finite() || !received_us.is_finite()
+            || captured_us < 0.0 || received_us < 0.0 { return false; }
+        self.controller.observe_face(crate::passive::Face {
+            azimuth, elevation, confidence, at: captured_us as u64,
+        }, received_us as u64)
+    }
+
     pub fn tick(&mut self, now_us: f64) -> Result<Option<String>, JsError> {
         let now = now_us as u64;
         self.clock_us = self.clock_us.max(now);
@@ -457,6 +483,7 @@ impl WebFsm {
     }
 
     fn key(&mut self, key: &str, down: bool, now: u64) -> bool {
+        if down { self.controller.disable_passive(); }
         if down {
             self.keys_down.insert(key.to_string());
         } else {
@@ -478,6 +505,7 @@ impl WebFsm {
     /// contract's to say, and a page that pressed `B` would be a page that knew.
     #[wasm_bindgen(js_name = letGo)]
     pub fn let_go(&mut self, now_us: f64) -> bool {
+        self.controller.disable_passive();
         if self.operators.is_empty() {
             return false;
         }
@@ -588,6 +616,7 @@ impl WebFsm {
     /// tell a typo from a stick nobody is touching.
     #[wasm_bindgen(js_name = setAxis)]
     pub fn set_axis(&mut self, axis: &str, value: f32) -> bool {
+        if value.abs() > 0.001 { self.controller.disable_passive(); }
         let Some(i) = crate::vocabulary::pad_axes().iter().position(|a| *a == axis) else {
             return false;
         };
@@ -618,6 +647,10 @@ impl WebFsm {
     /// whole of a motion nobody could start, and no host reported anything.
     #[wasm_bindgen(js_name = padFrame)]
     pub fn pad_frame(&mut self, now_us: f64) {
+        if self.pad.buttons.iter().any(|b| *b) || self.pad.axes.iter().any(|v| v.abs() > 0.001)
+            || self.pad.dpad_x != 0 || self.pad.dpad_y != 0 {
+            self.controller.disable_passive();
+        }
         if !self.operators.is_empty() {
             // To every mode's operator, whichever mode is running: the shift
             // layer and the release are the person's.
@@ -633,6 +666,7 @@ impl WebFsm {
     /// (`jumper.five_foot`'s arm).
     #[wasm_bindgen(js_name = setPad)]
     pub fn set_pad(&mut self, button: &str, down: bool) -> bool {
+        if down { self.controller.disable_passive(); }
         if !self.pad.set_dpad(button, down) {
             let Some(i) = crate::vocabulary::pad_buttons().iter().position(|b| *b == button) else {
                 return false;

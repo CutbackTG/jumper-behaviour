@@ -1,0 +1,13 @@
+{
+  "mode": "locomotion",
+  "twist_rad": 0.18,
+  "pitch_rad": 0.20,
+  "roll_rad": 0.04,
+  "rate_rad_s": 0.25,
+  "deadband_rad": 0.035,
+  "confidence_min": 0.65,
+  "face_timeout_s": 0.4,
+  "lost_hold_s": 1.0,
+  "dwell_s": 1.2,
+  "scan_interval_s": 4.0
+}

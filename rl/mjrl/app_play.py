@@ -222,7 +222,7 @@ def extension_for(extensions: dict, here: str) -> str | None:
     return None
 
 
-def _load_extension(bundle: Path, manifest: dict) -> tuple[Any, str]:
+def _load_extension(bundle: Path, manifest: dict, override: Path | None = None) -> tuple[Any, str]:
     """The bundle's own controller if it carries one, else whatever is installed.
 
     Prefer the bundle's, because otherwise this runs a *different build of the
@@ -238,6 +238,13 @@ def _load_extension(bundle: Path, manifest: dict) -> tuple[Any, str]:
     # extension per machine it was built on: `runtimes.mjlab.extensions`,
     # keyed by `sysconfig.get_platform()`.
     runtime = (manifest.get("runtimes") or {}).get("mjlab") or {}
+    if override is not None:
+        import sysconfig
+
+        if not override.is_file():
+            raise AppUnavailable(f"local controller override not found: {override}")
+        runtime = {"extensions": {sysconfig.get_platform(): {"file": str(override.resolve())}},
+                   "commit": "local development override"}
     built = runtime.get("extensions") or {}
     if built:
         import sysconfig
@@ -267,6 +274,9 @@ def _load_extension(bundle: Path, manifest: dict) -> tuple[Any, str]:
             # cache instead of this file, so that case defers to it and says so.
             if "mjrl_fsm" in sys.modules:
                 cached = sys.modules["mjrl_fsm"]
+                if override is not None and Path(cached.__file__).resolve() != override.resolve():
+                    raise AppUnavailable("another controller is already imported; "
+                                         "start a fresh process for --controller")
                 return cached, f"{cached.__file__} -- already imported, not this app's"
             # The loader is named rather than inferred from the suffix: `importlib`
             # matches a suffix against this interpreter's own list, which on
@@ -368,7 +378,8 @@ class AppPlayer:
     terms, taken over at construction, write the controller's targets instead.
     """
 
-    def __init__(self, app: App, env: Any, *, pad: Any = None) -> None:
+    def __init__(self, app: App, env: Any, *, pad: Any = None,
+                 passive_demo: Path | None = None, extension: Path | None = None) -> None:
         """A key is handed to the controller stamped with the simulator's time,
         and a held key's stick deflection grows on that clock (`full_after_s`
         in the task's `controls.yaml`). At real time the two agree; at `--speed
@@ -383,7 +394,16 @@ class AppPlayer:
 
         bundle = app.root
         manifest = json.loads((bundle / "bundle.json").read_text("utf-8"))
-        mjrl_fsm, origin = _load_extension(bundle, manifest)
+        mjrl_fsm, origin = (_load_extension(bundle, manifest) if extension is None
+                           else _load_extension(bundle, manifest, extension))
+        self._passive_config = passive_demo.read_text("utf-8") if passive_demo else None
+        self._passive_mode = (json.loads(self._passive_config)["mode"]
+                              if self._passive_config else None)
+        self._passive_started = False
+        self._passive_cancelled = False
+        if passive_demo and not hasattr(mjrl_fsm.Fsm, "enable_passive"):
+            raise AppUnavailable("rebuild the local controller for --passive-demo; "
+                                 "see docs/PO.md and supply --controller")
         ort = _load_onnxruntime()
         contracts = {
             mode: (bundle / entry["contract"]).read_text("utf-8")
@@ -543,6 +563,8 @@ class AppPlayer:
     def _person(self, now_us: int) -> None:
         """Keys down and up since the last step, and a frame of the pad."""
         downs, ups = self._viewer_keys.changes()
+        if downs:
+            self._passive_cancelled = True
         for name in downs:
             self._fsm.set_key(name, True, now_us)
         for name in ups:
@@ -554,6 +576,10 @@ class AppPlayer:
         if state is None or not getattr(self._pad, "connected", True):
             self._fsm.set_pad_frame([], {}, connected=False, now_us=now_us)
             return
+        if state.buttons or state.hat_x or state.hat_y or any(
+            abs(v) > 0.001 for v in (state.lx, state.ly, state.rx, state.ry, state.lt, state.rt)
+        ):
+            self._passive_cancelled = True
         self._fsm.set_pad_frame(
             sorted(b for b in state.buttons if b in self._buttons),
             {"Lx": state.lx, "Ly": state.ly, "Rx": state.rx, "Ry": state.ry,
@@ -564,6 +590,34 @@ class AppPlayer:
             dpad_y=-int(state.hat_y),
             now_us=now_us,
         )
+
+    def _attention(self, now: int, data: Any) -> None:
+        if self._passive_config is not None:
+            # Enable once, after the initial measured-pose hand-off. A manual
+            # takeover or fault cancels it; this demo must not silently re-arm.
+            if (not self._passive_started and not self._passive_cancelled
+                    and self._fsm.running_policy and self._fsm.mode == self._passive_mode):
+                self._fsm.enable_passive(self._passive_config, now)
+                self._passive_started = True
+                print("[play] passive demo: SYNTHETIC target, no camera detection")
+            if self._passive_started and self._fsm.passive_phase() is not None:
+                t = now * 1e-6
+                # A fixed world direction varying slowly left/right and up.
+                # Rotate into the body's frame so turning actually reduces error.
+                # 16..30 seconds: no observations, exercising loss and scanning.
+                if t % 30 < 16:
+                    az = 0.16 * math.sin(t * 0.35)
+                    el = 0.10 + 0.06 * math.sin(t * 0.2)
+                    direction = [math.cos(el) * math.cos(az),
+                                 math.cos(el) * math.sin(az), math.sin(el)]
+                    w, x, y, z = (float(v) for v in data.root_link_quat_w[0])
+                    dx, dy, dz = direction
+                    bx = (1-2*(y*y+z*z))*dx + 2*(x*y+w*z)*dy + 2*(x*z-w*y)*dz
+                    by = 2*(x*y-w*z)*dx + (1-2*(x*x+z*z))*dy + 2*(y*z+w*x)*dz
+                    bz = 2*(x*z+w*y)*dx + 2*(y*z-w*x)*dy + (1-2*(x*x+y*y))*dz
+                    self._fsm.observe_face(math.atan2(by, bx),
+                                           math.atan2(bz, math.hypot(bx, by)), 1.0, now, now)
+
 
     def __call__(self, obs):
         import numpy as np
@@ -589,6 +643,8 @@ class AppPlayer:
             now,
         )
         self._person(now)
+
+        self._attention(now, data)
 
         mode = self._fsm.tick(now)
         if mode is not None:

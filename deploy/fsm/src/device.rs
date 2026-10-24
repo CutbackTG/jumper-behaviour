@@ -197,6 +197,10 @@ impl DeviceHost {
     /// release are the person's, and a mode switched into has to have heard
     /// them.
     pub fn on_pad(&mut self, pad: &Pad, now: Micros) {
+        if pad.buttons.iter().any(|b| *b) || pad.axes.iter().any(|v| v.abs() > 0.001)
+            || pad.dpad_x != 0 || pad.dpad_y != 0 {
+            self.controller.disable_passive();
+        }
         self.pad = *pad;
         // No keyboard on the robot; the pad is the only source. A switch's
         // `from` is read against the mode the cascade is in now.
@@ -223,6 +227,18 @@ impl DeviceHost {
     pub fn controller(&self) -> &Controller {
         &self.controller
     }
+
+    /// Host integration only; this does not install a camera or a DDS face topic.
+    pub fn enable_passive(&mut self, config: crate::passive::Config, now: Micros)
+        -> Result<(), String> {
+        self.controller.enable_passive(config, now)
+    }
+
+    pub fn observe_face(&mut self, face: crate::passive::Face, received_at: Micros) -> bool {
+        self.controller.observe_face(face, received_at)
+    }
+
+    pub fn disable_passive(&mut self) { self.controller.disable_passive(); }
 
     /// Replay a bundle's reference vectors through this host.
     ///

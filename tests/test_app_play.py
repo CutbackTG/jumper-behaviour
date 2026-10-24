@@ -236,6 +236,72 @@ def test_a_fall_is_the_controller_s_before_it_is_the_world_s(tmp_path: Path) -> 
 # ── 2. The keys ───────────────────────────────────────────────────────────
 
 
+def test_attention_demo_waits_for_its_mode_and_never_rearms_after_manual() -> None:
+    """Wrong-mode startup must not crash; a cancelled demo must not silently re-arm."""
+    from types import SimpleNamespace
+
+    from mjrl.app_play import AppPlayer
+
+    player = object.__new__(AppPlayer)
+    player._passive_config = '{"mode":"locomotion"}'
+    player._passive_mode = "locomotion"
+    player._passive_started = False
+    player._passive_cancelled = False
+    armed = []
+    player._fsm = SimpleNamespace(
+        mode="jump", running_policy=True,
+        enable_passive=lambda config, now: armed.append(now),
+        passive_phase=lambda: None,
+        set_key=lambda *args: None, set_pad_frame=lambda *args, **kw: None,
+    )
+    player._attention(0, None)
+    assert not armed
+    player._fsm.mode = "locomotion"
+    player._viewer_keys = ViewerKeys({71: "key_g"})
+    player._pad = None
+    player._viewer_keys.report(71, True)
+    player._person(10)
+    player._viewer_keys.report(71, False)
+    player._person(20)
+    player._attention(20, None)
+    assert not armed, "a short manual press during ramp cancels pending attention"
+    # Positive control: a fresh opt-in can arm in the correct running mode.
+    player._passive_cancelled = False
+    player._attention(30, None)
+    player._attention(40, None)
+    assert armed == [30]
+
+
+def test_synthetic_attention_error_changes_when_the_body_turns() -> None:
+    """A scripted bearing independent of body pose would hide broken closed-loop tracking."""
+    from types import SimpleNamespace
+
+    from mjrl.app_play import AppPlayer
+
+    player = object.__new__(AppPlayer)
+    player._passive_config = "{}"
+    player._passive_mode = "locomotion"
+    player._passive_started = True
+    player._passive_cancelled = False
+    seen = []
+    player._fsm = SimpleNamespace(passive_phase=lambda: "Tracking",
+                                 observe_face=lambda *args: seen.append(args))
+    data = SimpleNamespace(root_link_quat_w=[[1, 0, 0, 0]])
+    player._attention(0, data)
+    assert seen[-1][:2] == pytest.approx((0, 0.10))
+    # Yaw left: the same world target is now to the robot's right.
+    data.root_link_quat_w = [[math.cos(0.1), 0, 0, math.sin(0.1)]]
+    player._attention(0, data)
+    assert seen[-1][0] == pytest.approx(-0.2)
+    # Nose-up pitch: looking at the target should cancel its vertical error.
+    data.root_link_quat_w = [[math.cos(0.05), 0, -math.sin(0.05), 0]]
+    player._attention(0, data)
+    assert seen[-1][1] == pytest.approx(0, abs=1e-6)
+    before = len(seen)
+    player._attention(20_000_000, data)
+    assert len(seen) == before, "target-loss interval must actually stop observations"
+
+
 def test_a_key_is_down_from_its_press_to_its_release() -> None:
     """Held, a key goes down once and comes up once, however long it is held
     and however many steps read it; a key the dictionary does not name is

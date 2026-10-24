@@ -39,6 +39,7 @@ pub mod obs;
 // A task's controls: several commands, one operator, the pad and the keyboard
 // as two paths. Portable: every host reads a pad, and two of them keys.
 pub mod operator;
+pub mod passive;
 // Replaying the reference vectors a bundle carries. Portable: the browser is
 // the host where a divergence is least visible and most worth measuring.
 pub mod reference;

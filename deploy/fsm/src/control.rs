@@ -125,6 +125,7 @@ struct HookRuntime {
 }
 
 pub struct Controller {
+    passive: Option<crate::passive::Passive>,
     fsm: Fsm,
     joints: usize,
     /// For every regime that is not a policy: warm start, ramp, hold.
@@ -333,6 +334,7 @@ impl Controller {
         }
 
         Ok(Self {
+            passive: None,
             fsm: Fsm::new(cfg, now),
             joints,
             hold: ActionDecoder::new(
@@ -417,6 +419,59 @@ impl Controller {
         self.active_mode.is_some() && !self.ramping
     }
 
+    /// Opt in only after the posture mode has finished its measured-pose ramp.
+    /// The prototype amplitudes must fit this export's parked training ranges.
+    pub fn enable_passive(&mut self, config: crate::passive::Config, now: Micros)
+        -> Result<(), String>
+    {
+        config.validate()?;
+        if self.state().name != config.mode || !self.is_running_policy() {
+            return Err("enable passive only in its running posture mode".into());
+        }
+        let mode = self.modes.get(&config.mode).ok_or("passive mode has no policy")?;
+        if !mode.contract.layout.observation.terms.iter()
+            .any(|t| t.name == "posture_command" && t.dim == 4) {
+            return Err("passive requires a four-channel posture observation".into());
+        }
+        let spec = mode.contract.layout.controller.as_ref().ok_or("missing posture controls")?;
+        let posture = spec.command.iter().find(|c| c.feeds == "posture_command")
+            .ok_or("passive requires the posture_command contract")?;
+        if posture.axes.iter().map(|a| a.name.as_str()).collect::<Vec<_>>()
+            != ["twist", "pitch", "roll", "height"] {
+            return Err("passive requires twist, pitch, roll, height axes in order".into());
+        }
+        let neutral = posture.axes[3].rest.ok_or("missing neutral posture height")?;
+        if !neutral.is_finite() || neutral <= 0.0 {
+            return Err("invalid neutral posture height".into());
+        }
+        let ranges = mode.contract.layout.command_ranges.term(&posture.term)
+            .ok_or("missing posture ranges")?;
+        let [lo, hi] = *ranges.get("height").ok_or("missing height range")?;
+        if !lo.is_finite() || !hi.is_finite() || neutral < lo || neutral > hi {
+            return Err("neutral height is outside the policy range".into());
+        }
+        for (name, amplitude) in [("twist", config.twist_rad), ("pitch", config.pitch_rad),
+            ("roll", config.roll_rad)] {
+            let [lo, hi] = *ranges.get(name).ok_or("missing posture axis range")?;
+            if !lo.is_finite() || !hi.is_finite() || -amplitude < lo || amplitude > hi {
+                return Err(format!("passive {name} amplitude exceeds this policy's range"));
+            }
+        }
+        self.passive = Some(crate::passive::Passive::new(config, now)?);
+        Ok(())
+    }
+
+    pub fn disable_passive(&mut self) { self.passive = None; }
+
+    pub fn passive_phase(&self) -> Option<crate::passive::Phase> {
+        self.passive.as_ref().map(|p| p.phase())
+    }
+
+    /// Perception never refreshes the host's operator heartbeat.
+    pub fn observe_face(&mut self, face: crate::passive::Face, received_at: Micros) -> bool {
+        self.passive.as_mut().is_some_and(|p| p.observe(face, received_at))
+    }
+
     pub fn tick(&mut self, input: &TickInput<'_>, now: Micros) -> Result<Step, Error> {
         // An outstanding request is abandoned rather than carried: the world has
         // moved on by a tick, and an action decoded against a stale observation
@@ -439,6 +494,12 @@ impl Controller {
             self.fsm.update(&inputs, now).name.clone()
         };
         let state = self.fsm.current().clone();
+        if self.passive.as_ref().is_some_and(|p| p.config.mode != mode_name)
+            || !input.state_fresh || !input.command_fresh
+            || !state.has_model() || state.hold_current || self.interlocked.contains(&mode_name)
+        {
+            self.disable_passive();
+        }
 
         if state.warm_start && input.state_fresh {
             let target = self.warm_target().unwrap_or(&self.default_wire).to_vec();
@@ -528,10 +589,24 @@ impl Controller {
         // -- its sticks, its ranges, its task's controls -- and the host's
         // command where it does not. Read here, once the cascade has picked the
         // mode, because which operator applies is exactly what it decided.
-        let (target, controls) = match input.operators.and_then(|o| o.get(&mode_name)) {
+        let (mut target, controls) = match input.operators.and_then(|o| o.get(&mode_name)) {
             Some(operator) => (operator.command(), operator.task_controls()),
             None => (*input.command, input.controls.clone()),
         };
+        if let Some(passive) = self.passive.as_mut() {
+            let spec = mode.contract.layout.controller.as_ref().expect("validated at opt-in");
+            let mut rest = Command::default();
+            let manual = spec.command.iter().flat_map(|c| &c.axes).any(|a| {
+                let neutral = a.rest.unwrap_or(0.0);
+                rest.set_axis(&a.name, neutral);
+                target.axis(&a.name).is_none_or(|v| !v.is_finite() || (v - neutral).abs() > 1e-5)
+            }) || controls.iter().any(|(_, v)| v != 0.0) || !input.buttons.is_empty();
+            if manual {
+                self.passive = None;
+            } else {
+                target = passive.command(rest, now);
+            }
+        }
         // What the policy was trained to see of the operator: held to its moving
         // band while walking and ramped at its rate, where the contract says so.
         let mut command = match mode.shaper.as_mut() {
@@ -2392,6 +2467,113 @@ mod tests {
         // action_scale 0.25, use_default_offset around home 0: the target is 0.25.
         assert!((last - 0.25).abs() < 0.01, "converged to {last}, not the decoded target");
     }
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    fn tuning() -> crate::passive::Config {
+        serde_json::from_str(include_str!("../../po.json")).unwrap()
+    }
+
+    fn fixture() -> (Controller, Operators, Micros) {
+        let mut p = posed_contract([0.1, 0.2], 0.5);
+        let spec = p.layout.controller.as_mut().unwrap();
+        spec.command[1].feeds = "posture_command".into();
+        spec.command[1].axes.sort_by_key(|a| match a.name.as_str() {
+            "twist" => 0, "pitch" => 1, _ => 2,
+        });
+        spec.command[1].axes.push(serde_json::from_value(
+            serde_json::json!({"name":"height", "rest":0.107})).unwrap());
+        spec.devices.gamepad.axes.insert("height".into(), serde_json::from_value(
+            serde_json::json!({"source":"Ry", "sign":1, "shifted":true})).unwrap());
+        spec.devices.keyboard.axes.insert("height".into(), serde_json::from_value(
+            serde_json::json!({"+": ["key_n"], "-": ["key_m"]})).unwrap());
+        p.layout.command_ranges.other.get_mut("body_pose").unwrap()
+            .insert("height".into(), [0.07, 0.15]);
+        p.layout.observation.dim = 6;
+        p.layout.observation.terms[0] = serde_json::from_value(serde_json::json!({
+            "name":"posture_command", "dim":4, "params":{"neutral_height":0.107}
+        })).unwrap();
+        let ops = Operators::of([("locomotion", &p)].into_iter()).unwrap();
+        let mut contracts = HashMap::new();
+        contracts.insert("locomotion".into(), p);
+        for name in ["carry", "jump"] {
+            contracts.insert(name.into(), contract([0.1, 0.2], 50.0, 0.0));
+        }
+        let mut c = Controller::new(FsmConfig::parse(EXAMPLE).unwrap(), setup(), contracts, 0)
+            .unwrap();
+        let (_, now) = run_to_infer(&mut c, [0.1, 0.2], 0);
+        (c, ops, now)
+    }
+
+    // With and without attention are the control groups for silent Operator masking.
+    #[test]
+    fn attention_reaches_observation_with_operators_and_yields_to_manual() {
+        let (mut c, mut ops, now) = fixture();
+        c.enable_passive(tuning(), now).unwrap();
+        assert!(c.observe_face(crate::passive::Face {
+            azimuth:0.2, elevation:0.3, confidence:1.0, at:now,
+        }, now));
+        let robot = at([0.1, 0.2]);
+        let host = Command::default();
+        c.tick(&TickInput { operators:Some(&ops), ..input(&robot, &host) }, now+20_000)
+            .unwrap();
+        assert!(c.observation()[0] > 0.0 && c.observation()[1] < 0.0);
+        assert_eq!(c.observation()[3], 0.0, "neutral height must not become zero height");
+        let mut pad = PAD_IDLE;
+        pad.connected = true;
+        let ry = crate::vocabulary::pad_axes().iter().position(|a| *a == "Ry").unwrap();
+        pad.axes[ry] = -1.0;
+        ops.pad(&pad);
+        for n in 2..30 {
+            c.tick(&TickInput { operators:Some(&ops), ..input(&robot, &host) }, now+n*20_000)
+                .unwrap();
+        }
+        assert_eq!(c.passive_phase(), None);
+        assert!(c.observation()[1] > 0.0, "manual nose-down must replace attention");
+        pad.axes[ry] = 0.0;
+        ops.pad(&pad);
+        c.tick(&TickInput { operators:Some(&ops), ..input(&robot, &host) }, now+600_000)
+            .unwrap();
+        assert_eq!(c.passive_phase(), None, "release is not permission to restart");
+    }
+
+    // Test between inference ticks: safety cancellation cannot wait for policy inference.
+    #[test]
+    fn stale_inputs_cancel_attention_without_restart() {
+        for feedback in [true, false] {
+            let (mut c, ops, now) = fixture();
+            c.enable_passive(tuning(), now).unwrap();
+            let robot = at([0.1, 0.2]);
+            let host = ops.get("locomotion").unwrap().rest();
+            c.tick(&TickInput { state_fresh:!feedback, command_fresh:feedback,
+                operators:Some(&ops), ..input(&robot, &host) }, now+1_000).unwrap();
+            assert_eq!(c.passive_phase(), None);
+            for n in 1..20 {
+                c.tick(&TickInput { operators:Some(&ops), ..input(&robot, &host) },
+                    now+n*20_000).unwrap();
+            }
+            assert_eq!(c.passive_phase(), None);
+        }
+    }
+
+    #[test]
+    fn incompatible_mode_and_excessive_ranges_refuse_attention() {
+        let (mut c, _, now) = fixture();
+        let mut cfg = tuning();
+        cfg.mode = "carry".into();
+        assert!(c.enable_passive(cfg, now).is_err());
+        let mut cfg = tuning();
+        cfg.pitch_rad = 0.5;
+        assert!(c.enable_passive(cfg, now).is_err());
+        let mut incompatible = controller([0.1, 0.2], 50.0, 0.0);
+        let (_, t) = run_to_infer(&mut incompatible, [0.1, 0.2], 0);
+        assert!(incompatible.enable_passive(tuning(), t).is_err());
+        c.enable_passive(tuning(), now).unwrap();
+        assert!(c.passive_phase().is_some(), "compatible running policy is the positive control");
+    }
+}
 }
 
 /// What the operator is asking for, this tick.

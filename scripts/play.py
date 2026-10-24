@@ -285,6 +285,10 @@ def main() -> None:
         "environment is the world only, the app's default mode's task unless "
         "--task names another",
     )
+    r.add_argument("--passive-demo", type=Path, metavar="CONFIG",
+                   help="stationary synthetic-face attention demo with --app; tuning JSON")
+    r.add_argument("--controller", type=Path, metavar="EXTENSION",
+                   help="explicit local controller extension override for --app development")
     # An app decides the world before anything is parsed: the default mode's
     # task, unless this command line names another. MJRL_TASK in .env is
     # somebody's everyday training choice, not a choice about this app; and the
@@ -310,6 +314,8 @@ def main() -> None:
         args = parse_with_task_args(parser, opened.default_task if opened else None)
         _validate_video_args(parser, args)
         _validate_command_args(parser, args)
+        if (args.passive_demo or args.controller) and opened is None:
+            parser.error("--passive-demo and --controller require --app")
         if opened is not None and (
             args.checkpoint or args.agent != "trained"
         ):
@@ -484,7 +490,8 @@ def _run(spec, res, asset: Path | None, args) -> None:
                 pad = controller.open()
             except Exception as error:  # noqa: BLE001 - a missing pad is the keyboard
                 print(f"[play] no gamepad ({error}); the viewer's keys drive")
-            policy = AppPlayer(args.opened_app, wrapped, pad=pad)
+            policy = AppPlayer(args.opened_app, wrapped, pad=pad,
+                               passive_demo=args.passive_demo, extension=args.controller)
         elif trained:
             from dataclasses import asdict
 

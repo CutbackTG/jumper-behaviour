@@ -310,6 +310,9 @@ impl PyFsm {
     /// scales them (`operators`).
     #[pyo3(signature = (lin_vel_x, lin_vel_y, yaw_rate, now_us = 0))]
     fn set_command(&mut self, lin_vel_x: f32, lin_vel_y: f32, yaw_rate: f32, now_us: u64) {
+        if lin_vel_x != 0.0 || lin_vel_y != 0.0 || yaw_rate != 0.0 {
+            self.controller.disable_passive();
+        }
         self.command = Command { lin_vel_x, lin_vel_y, yaw_rate, ..self.rest() };
         self.last_command_us = Some(now_us);
     }
@@ -324,6 +327,7 @@ impl PyFsm {
     /// shown the neutral posture while the screen says it was asked to lean.
     #[pyo3(signature = (names, values, now_us = 0))]
     fn set_command_axes(&mut self, names: Vec<String>, values: Vec<f32>, now_us: u64) -> PyResult<()> {
+        self.controller.disable_passive();
         if names.len() != values.len() {
             return Err(err(format!("{} names and {} values", names.len(), values.len())));
         }
@@ -353,6 +357,7 @@ impl PyFsm {
     /// bind it.
     #[pyo3(signature = (key, down, now_us = None))]
     fn set_key(&mut self, key: &str, down: bool, now_us: Option<u64>) -> bool {
+        if down { self.controller.disable_passive(); }
         if down {
             self.keys_down.insert(key.to_string());
         } else {
@@ -408,6 +413,10 @@ impl PyFsm {
         }
         pad.dpad_x = dpad_x.signum();
         pad.dpad_y = dpad_y.signum();
+        if pad.buttons.iter().any(|b| *b) || pad.axes.iter().any(|v| v.abs() > 0.001)
+            || pad.dpad_x != 0 || pad.dpad_y != 0 {
+            self.controller.disable_passive();
+        }
         self.pad = pad;
         let now = now_us.unwrap_or(self.clock_us);
         self.clock_us = self.clock_us.max(now);
@@ -421,6 +430,7 @@ impl PyFsm {
     /// Whether a **pad** button is down, for a host reading a gamepad. Same
     /// contract as the key call, with the robot pad service's names.
     fn set_pad(&mut self, button: &str, down: bool) -> bool {
+        if down { self.controller.disable_passive(); }
         let Some(i) = crate::vocabulary::pad_buttons().iter().position(|b| *b == button) else {
             return false;
         };
@@ -429,6 +439,24 @@ impl PyFsm {
     }
     /// One tick. Returns the mode needing an inference, or `None` when the step
     /// is finished and `positions()` is ready.
+    fn enable_passive(&mut self, config_json: &str, now_us: u64) -> PyResult<()> {
+        let config = serde_json::from_str(config_json).map_err(err)?;
+        self.controller.enable_passive(config, now_us).map_err(err)
+    }
+
+    fn disable_passive(&mut self) { self.controller.disable_passive(); }
+
+    fn passive_phase(&self) -> Option<String> {
+        self.controller.passive_phase().map(|p| format!("{p:?}"))
+    }
+
+    fn observe_face(&mut self, azimuth: f32, elevation: f32, confidence: f32,
+        captured_us: u64, received_us: u64) -> bool {
+        self.controller.observe_face(crate::passive::Face {
+            azimuth, elevation, confidence, at: captured_us,
+        }, received_us)
+    }
+
     fn tick(&mut self, now_us: u64) -> PyResult<Option<String>> {
         self.clock_us = self.clock_us.max(now_us);
         if let Some(ops) = self.operators.as_mut() {
