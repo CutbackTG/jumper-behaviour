@@ -401,6 +401,7 @@ class AppPlayer:
                               if self._passive_config else None)
         self._passive_started = False
         self._passive_cancelled = False
+        self._passive_heading = 0.0
         if passive_demo and not hasattr(mjrl_fsm.Fsm, "enable_passive"):
             raise AppUnavailable("rebuild the local controller for --passive-demo; "
                                  "see docs/PO.md and supply --controller")
@@ -598,6 +599,8 @@ class AppPlayer:
             if (not self._passive_started and not self._passive_cancelled
                     and self._fsm.running_policy and self._fsm.mode == self._passive_mode):
                 self._fsm.enable_passive(self._passive_config, now)
+                w, x, y, z = (float(v) for v in data.root_link_quat_w[0])
+                self._passive_heading = math.atan2(2*(w*z+x*y), 1-2*(y*y+z*z))
                 self._passive_started = True
                 print("[play] passive demo: SYNTHETIC target, no camera detection")
             if self._passive_started and self._fsm.passive_phase() is not None:
@@ -606,7 +609,7 @@ class AppPlayer:
                 # Rotate into the body's frame so turning actually reduces error.
                 # 16..30 seconds: no observations, exercising loss and scanning.
                 if t % 30 < 16:
-                    az = 0.16 * math.sin(t * 0.35)
+                    az = self._passive_heading + 0.16 * math.sin(t * 0.35)
                     el = 0.10 + 0.06 * math.sin(t * 0.2)
                     direction = [math.cos(el) * math.cos(az),
                                  math.cos(el) * math.sin(az), math.sin(el)]

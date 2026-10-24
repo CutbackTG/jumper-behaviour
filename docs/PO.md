@@ -16,6 +16,7 @@ this clone's `.venv`, not the design environment. From the repository root:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
+$env:PYTHONUTF8 = "1"
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" build --manifest-path deploy/fsm/Cargo.toml --release --no-default-features --features py --locked
 python scripts/play.py --app out/bundle_example/jumper --controller deploy/fsm/target/release/mjrl_fsm.dll --passive-demo deploy/po.json --backend native --device cpu
 ```
@@ -26,6 +27,7 @@ example runtime or claim to be a rebuilt upload bundle. Without the two new
 options, app playback behaves as before.
 
 For a bounded recording, add `--headless --steps 6000 --video outputs/po.mp4`.
+For a front three-quarter view, also add `--video-azimuth 140`.
 The demo uses a synthetic direction that varies sideways and upward. Its bearing
 is recomputed from the simulated body attitude, so the error changes as Po turns.
 During seconds 16 through 30 of each cycle there are no target observations.
@@ -66,12 +68,22 @@ browser interface compiled, and the updated Python extension ran 800 actual
 posture-policy ONNX inferences with finite outputs using static synthetic motor
 feedback. Positive target elevation produced negative pitch (down to the chosen
 -0.20 rad cap), and Escape cancelled attention. Static feedback cannot establish
-that the robot physically follows a face or remains stable. The complete Python
-simulation environment, device build and visual replay still need verification.
+that the robot physically follows a face or remains stable. A subsequent full environment check passed all six setup gates, including the
+device build and runtime load. The five-iteration GPU training smoke test also
+completed; it is an environment check, not a newly trained behaviour policy.
+
+Native MuJoCo replay on 2026-10-24 completed an eight-second neutral baseline
+and a 30-second synthetic attention run. After the first three seconds, the
+baseline stayed within 0.9 degrees of level with 2.1 mm maximum horizontal
+displacement. Attention reached 9.0 degrees nose-up, with 11.6 mm maximum
+horizontal displacement. It entered holding at 16.4 seconds, returning at 17.4
+and scanning at 21.4; the controller remained in locomotion throughout. These
+are single-run simulation measurements, not hardware stability guarantees.
+The replay uses the standard Jumper appearance and no live camera input.
 
 ## Next milestones
 
-1. Validate the existing posture policy and this attention demo in simulation.
+1. Review the recorded attention motion and tune its timing in simulation.
 2. Add a live camera adapter with stable face selection, calibrated bearings,
    exposure timestamps, measured latency and target-loss handling. Do not assume
    a desktop webcam demonstrates the robot's own camera path.
@@ -83,3 +95,50 @@ simulation environment, device build and visual replay still need verification.
 
 Po's appearance remains in the separate `jumper-design` repository as a `.skin`.
 There is no skin importer in this training repository.
+
+## Submission target: po.app
+
+The deliverable is the `.app` produced by `scripts/deploy.py`, following
+`deploy/BUNDLE.md` and the deploy skill. Do not rename a source archive or ship
+an `--allow-incomplete` build. The Po `.skin` remains a separate Design artifact.
+Before the release, compare this checkout's bundle protocol and schema with
+KingKongRobotics/jumper main; upstream may have changed since this fork.
+These are repository checks, not a claim about an unpublished submission rubric.
+
+Release requirements, still pending:
+
+- Make attention configuration and explicit opt-in available through the bundled
+  controller on board, web and simulation. The current `--passive-demo` reads an
+  external JSON file and sends synthetic observations; it is a development harness.
+  Adding a loose `po.json` to the archive is insufficient: the bundle schema,
+  packer and readers must agree on how configuration is carried and consumed.
+- Define the robot camera/perception transport, face selection, calibrated bearings
+  and monotonic exposure timestamps. Verify lost/stale frames and manual takeover
+  using the actual board integration. Device API methods alone do not supply frames.
+- Create a named `po` deployment manifest using verified posture exports and an
+  explicit control scheme. Preserve safety, joint limits and training ranges.
+- Build with the normal deploy workflow: fresh aarch64 controller, ONNX and
+  matching RK3576 RKNN models, web runtime and supported playback extensions.
+  Docker is required for the board cross-build and RKNN conversion on Windows.
+- Pass bundle schema/file validation and controller loading for every declared
+  host. Add the generated English manual and checked Chinese translation through
+  the bundle-manual skill; translation repacks the archive.
+- Replay reference vectors through the bundled runtimes. Observation and target
+  error must be within 1e-6 with no mode mismatch; assess RKNN action error
+  separately against the converter's tolerance. Default reference vectors alone
+  do not exercise passive tracking: separately exercise acquisition, tracking,
+  target loss, scanning, cancellation and safety through the shipping runtime.
+- Replay the final `.app` directly with `scripts/play.py --app <path-to-po.app>`
+  using its own extension, without `--controller` or external passive config.
+  Exercise every shipped mode and verify no missing runtime, model or stub.
+- Extract the final archive to a clean directory, check ZIP integrity, root-level
+  `bundle.json`, exact file inventory and every recorded file digest. Check the
+  board binary's executable permission. Run the board's read-only compatibility
+  preflight, `--dry-run` and `--check-reference` when a board is available.
+- Record the source commit, build/tool versions, checks and final archive SHA256
+  outside the bundle. Test and hash after translation; any repack invalidates
+  the previous release hash. Report board checks as pending if no board was used.
+
+Do not call the prototype submission-ready until these checks pass on the actual
+archive. If the submission portal publishes additional limits or rules, check
+those against the finished artifact as well.

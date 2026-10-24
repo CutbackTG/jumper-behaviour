@@ -267,8 +267,9 @@ def test_attention_demo_waits_for_its_mode_and_never_rearms_after_manual() -> No
     assert not armed, "a short manual press during ramp cancels pending attention"
     # Positive control: a fresh opt-in can arm in the correct running mode.
     player._passive_cancelled = False
-    player._attention(30, None)
-    player._attention(40, None)
+    data = SimpleNamespace(root_link_quat_w=[[1, 0, 0, 0]])
+    player._attention(30, data)
+    player._attention(40, data)
     assert armed == [30]
 
 
@@ -283,6 +284,7 @@ def test_synthetic_attention_error_changes_when_the_body_turns() -> None:
     player._passive_mode = "locomotion"
     player._passive_started = True
     player._passive_cancelled = False
+    player._passive_heading = 0.0
     seen = []
     player._fsm = SimpleNamespace(passive_phase=lambda: "Tracking",
                                  observe_face=lambda *args: seen.append(args))
@@ -297,6 +299,11 @@ def test_synthetic_attention_error_changes_when_the_body_turns() -> None:
     data.root_link_quat_w = [[math.cos(0.05), 0, -math.sin(0.05), 0]]
     player._attention(0, data)
     assert seen[-1][1] == pytest.approx(0, abs=1e-6)
+    # Spawn yaw is randomized: the synthetic person starts in front, not at world +X.
+    player._passive_heading = 1.0
+    data.root_link_quat_w = [[math.cos(0.5), 0, 0, math.sin(0.5)]]
+    player._attention(0, data)
+    assert seen[-1][:2] == pytest.approx((0, 0.10), abs=1e-6)
     before = len(seen)
     player._attention(20_000_000, data)
     assert len(seen) == before, "target-loss interval must actually stop observations"
